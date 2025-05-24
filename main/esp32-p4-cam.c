@@ -38,8 +38,6 @@ static const char *TAG = "ESP32-P4-CAM";
 static esp_cam_sensor_device_t *camera = NULL;
 static esp_h264_enc_handle_t h264_encoder = NULL;
 static httpd_handle_t server = NULL;  // Add server handle declaration
-static esp_sccb_io_handle_t sccb_handle = NULL;  // SCCB IO handle
-static i2c_master_bus_handle_t i2c_bus_handle = NULL;  // I2C bus handle
 #define CAMERA_I2C_PORT 0
 
 // Camera configuration for ESP32-P4 dev board with SC2336
@@ -74,6 +72,9 @@ static uint8_t *h264_out_buf = NULL; // Output buffer (adjust size as needed)
 // Add a flag to signal new frame
 static volatile bool new_frame_ready = false;
 
+// Add a global variable to store the encoded frame size
+static size_t encoded_frame_size = 0;
+
 // HTTP server handlers
 static esp_err_t stream_handler(httpd_req_t *req)
 {
@@ -84,8 +85,8 @@ static esp_err_t stream_handler(httpd_req_t *req)
             vTaskDelay(pdMS_TO_TICKS(10)); // 10ms delay
         }
 
-        // Send H264 data
-        esp_err_t res = httpd_resp_send_chunk(req, (const char *)h264_out_buf, CAMERA_WIDTH * CAMERA_HEIGHT);
+        // Send H264 data using the actual encoded frame size
+        esp_err_t res = httpd_resp_send_chunk(req, (const char *)h264_out_buf, encoded_frame_size);
         if (res != ESP_OK) {
             // Connection closed or error
             break;
@@ -224,7 +225,11 @@ static void h264_encoder_init(void)
         .gop = H264_GOP,
         .fps = CAMERA_FPS,
         .res = { .width = CAMERA_WIDTH, .height = CAMERA_HEIGHT },
-        .rc = { .bitrate = H264_BITRATE, .qp_min = H264_QP_MIN, .qp_max = H264_QP_MAX },
+        .rc = { 
+            .bitrate = H264_BITRATE,
+            .qp_min = H264_QP_MIN,
+            .qp_max = H264_QP_MAX,
+        },
     };
     esp_h264_err_t err = esp_h264_enc_hw_new(&enc_cfg, &h264_encoder);
     if (err != ESP_H264_ERR_OK || !h264_encoder) {
@@ -376,9 +381,44 @@ static void capture_and_encode_task(void *arg)
         if (err != ESP_H264_ERR_OK) {
             ESP_LOGE(TAG, "Failed to encode frame: %d", err);
         } else {
+            // Debug: Print first few bytes of encoded data to verify NAL units
+            ESP_LOGI(TAG, "Encoded frame: %d bytes", enc_out.raw_data.len);
+            if (enc_out.raw_data.len > 0) {
+                ESP_LOGI(TAG, "First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                    enc_out.raw_data.buffer[0], enc_out.raw_data.buffer[1], enc_out.raw_data.buffer[2], enc_out.raw_data.buffer[3],
+                    enc_out.raw_data.buffer[4], enc_out.raw_data.buffer[5], enc_out.raw_data.buffer[6], enc_out.raw_data.buffer[7],
+                    enc_out.raw_data.buffer[8], enc_out.raw_data.buffer[9], enc_out.raw_data.buffer[10], enc_out.raw_data.buffer[11],
+                    enc_out.raw_data.buffer[12], enc_out.raw_data.buffer[13], enc_out.raw_data.buffer[14], enc_out.raw_data.buffer[15]);
+                
+                // Log all NAL unit types and sizes in the buffer
+                size_t i = 0;
+                while (i + 4 < enc_out.raw_data.len) {
+                    if (enc_out.raw_data.buffer[i] == 0x00 && enc_out.raw_data.buffer[i+1] == 0x00 &&
+                        enc_out.raw_data.buffer[i+2] == 0x00 && enc_out.raw_data.buffer[i+3] == 0x01) {
+                        uint8_t nal_type = enc_out.raw_data.buffer[i+4] & 0x1F;
+                        // Find the next NAL unit start
+                        size_t next_nal = i + 4;
+                        while (next_nal + 4 < enc_out.raw_data.len) {
+                            if (enc_out.raw_data.buffer[next_nal] == 0x00 && 
+                                enc_out.raw_data.buffer[next_nal+1] == 0x00 &&
+                                enc_out.raw_data.buffer[next_nal+2] == 0x00 && 
+                                enc_out.raw_data.buffer[next_nal+3] == 0x01) {
+                                break;
+                            }
+                            next_nal++;
+                        }
+                        size_t nal_size = next_nal - i;
+                        ESP_LOGI(TAG, "NAL unit type: %d at offset %d, size: %d bytes", nal_type, (int)i, (int)nal_size);
+                        i = next_nal;
+                    } else {
+                        i++;
+                    }
+                }
+            }
+            // Store the encoded frame size
+            encoded_frame_size = enc_out.raw_data.len;
             // Signal that a new encoded frame is ready
             new_frame_ready = true;
-            // ESP_LOGI(TAG, "Encoded frame: %d bytes", enc_out.raw_data.len);
         }
 
         // Queue buffer back
