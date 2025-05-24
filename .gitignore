@@ -1,0 +1,7 @@
+build*
+warnings.txt
+managed_components
+dependencies.lock
+*log.txt
+.claude
+.DS_Store
