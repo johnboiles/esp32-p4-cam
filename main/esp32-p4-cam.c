@@ -30,6 +30,8 @@
 #define MAP_FAILED ((void *)-1)
 #endif
 
+#define BUFFER_COUNT 2
+
 static const char *TAG = "ESP32-P4-CAM";
 
 // Camera and encoder handles
@@ -69,10 +71,32 @@ static i2c_master_bus_handle_t i2c_bus_handle = NULL;  // I2C bus handle
 static uint8_t *camera_frame_buf = NULL; // For RGB565
 static uint8_t *h264_out_buf = NULL; // Output buffer (adjust size as needed)
 
+// Add a flag to signal new frame
+static volatile bool new_frame_ready = false;
+
 // HTTP server handlers
 static esp_err_t stream_handler(httpd_req_t *req)
 {
-    // TODO: Implement MJPEG streaming
+    httpd_resp_set_type(req, "video/H264");
+    while (1) {
+        // Wait for a new frame
+        while (!new_frame_ready) {
+            vTaskDelay(pdMS_TO_TICKS(10)); // 10ms delay
+        }
+
+        // Send H264 data
+        esp_err_t res = httpd_resp_send_chunk(req, (const char *)h264_out_buf, CAMERA_WIDTH * CAMERA_HEIGHT);
+        if (res != ESP_OK) {
+            // Connection closed or error
+            break;
+        }
+
+        // Reset the flag
+        new_frame_ready = false;
+
+        // Optional: Add a small delay to control the streaming rate
+        vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay
+    }
     return ESP_OK;
 }
 
@@ -205,9 +229,17 @@ static void h264_encoder_init(void)
     esp_h264_err_t err = esp_h264_enc_hw_new(&enc_cfg, &h264_encoder);
     if (err != ESP_H264_ERR_OK || !h264_encoder) {
         ESP_LOGE(TAG, "Failed to initialize H264 encoder: %d", err);
+        h264_encoder = NULL;
         return;
     }
-    ESP_LOGI(TAG, "H264 encoder initialized");
+    err = esp_h264_enc_open(h264_encoder);
+    if (err != ESP_H264_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to open H264 encoder: %d", err);
+        esp_h264_enc_del(h264_encoder);
+        h264_encoder = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "H264 encoder initialized and opened");
 }
 
 // Frame capture and encoding (polling example)
@@ -218,8 +250,8 @@ static void capture_and_encode_task(void *arg)
     struct v4l2_format format;
     struct v4l2_requestbuffers req;
     struct v4l2_buffer buf;
-    uint8_t *buffer = NULL;
-    size_t buffer_size = 0;
+    uint8_t *buffer[BUFFER_COUNT];
+    size_t buffer_size[BUFFER_COUNT];
 
     // Open video device
     fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
@@ -266,7 +298,7 @@ static void capture_and_encode_task(void *arg)
 
     // Request buffers
     memset(&req, 0, sizeof(req));
-    req.count = 2;  // Request 2 buffers
+    req.count = BUFFER_COUNT;  // Request BUFFER_COUNT buffers
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
 
@@ -277,38 +309,42 @@ static void capture_and_encode_task(void *arg)
     }
 
     // Map the buffers
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = 0;
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
 
-    if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-        ESP_LOGE(TAG, "Failed to query buffer");
-        close(fd);
-        return;
-    }
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            ESP_LOGE(TAG, "Failed to query buffer");
+            close(fd);
+            return;
+        }
 
-    buffer_size = buf.length;
-    buffer = mmap(NULL, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
-    if (buffer == MAP_FAILED) {
-        ESP_LOGE(TAG, "Failed to map buffer");
-        close(fd);
-        return;
-    }
+        buffer_size[i] = buf.length;
+        buffer[i] = mmap(NULL, buffer_size[i], PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffer[i] == MAP_FAILED) {
+            ESP_LOGE(TAG, "Failed to map buffer");
+            close(fd);
+            return;
+        }
 
-    // Queue the buffer
-    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-        ESP_LOGE(TAG, "Failed to queue buffer");
-        munmap(buffer, buffer_size);
-        close(fd);
-        return;
+        // Queue the buffer
+        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            ESP_LOGE(TAG, "Failed to queue buffer");
+            munmap(buffer[i], buffer_size[i]);
+            close(fd);
+            return;
+        }
     }
 
     // Start streaming
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
         ESP_LOGE(TAG, "Failed to start streaming");
-        munmap(buffer, buffer_size);
+        for (int i = 0; i < BUFFER_COUNT; i++) {
+            munmap(buffer[i], buffer_size[i]);
+        }
         close(fd);
         return;
     }
@@ -321,9 +357,29 @@ static void capture_and_encode_task(void *arg)
             break;
         }
 
-        // Process the frame
-        // TODO: Add your frame processing code here
-        ESP_LOGI(TAG, "Captured frame: %d bytes", buf.bytesused);
+        // Check encoder handle before encoding
+        if (!h264_encoder) {
+            ESP_LOGE(TAG, "H264 encoder not initialized or opened");
+            break;
+        }
+
+        // Encode the frame using H264 encoder
+        esp_h264_enc_in_frame_t enc_in = {0};
+        enc_in.raw_data.buffer = buffer[buf.index];
+        enc_in.raw_data.len = buf.bytesused;
+
+        esp_h264_enc_out_frame_t enc_out = {0};
+        enc_out.raw_data.buffer = h264_out_buf;
+        enc_out.raw_data.len = CAMERA_WIDTH * CAMERA_HEIGHT; // or a safe max size
+
+        esp_h264_err_t err = esp_h264_enc_process(h264_encoder, &enc_in, &enc_out);
+        if (err != ESP_H264_ERR_OK) {
+            ESP_LOGE(TAG, "Failed to encode frame: %d", err);
+        } else {
+            // Signal that a new encoded frame is ready
+            new_frame_ready = true;
+            // ESP_LOGI(TAG, "Encoded frame: %d bytes", enc_out.raw_data.len);
+        }
 
         // Queue buffer back
         if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
@@ -338,7 +394,9 @@ static void capture_and_encode_task(void *arg)
     }
 
     // Cleanup
-    munmap(buffer, buffer_size);
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        munmap(buffer[i], buffer_size[i]);
+    }
     close(fd);
 }
 
@@ -384,9 +442,18 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_video_init(&video_config));
 
-    // Allocate large buffers in SPIRAM
-    camera_frame_buf = (uint8_t *)heap_caps_malloc(CAMERA_WIDTH * CAMERA_HEIGHT * 2, MALLOC_CAP_SPIRAM);
-    h264_out_buf = (uint8_t *)heap_caps_malloc(CAMERA_WIDTH * CAMERA_HEIGHT, MALLOC_CAP_SPIRAM);
+    // Allocate large buffers in SPIRAM with proper cache alignment
+    const size_t cache_line_size = 64;  // ESP32 cache line size
+    const size_t frame_size = CAMERA_WIDTH * CAMERA_HEIGHT * 2;
+    const size_t h264_size = CAMERA_WIDTH * CAMERA_HEIGHT;
+    
+    // Align sizes up to cache line size
+    const size_t aligned_frame_size = (frame_size + cache_line_size - 1) & ~(cache_line_size - 1);
+    const size_t aligned_h264_size = (h264_size + cache_line_size - 1) & ~(cache_line_size - 1);
+    
+    camera_frame_buf = (uint8_t *)heap_caps_aligned_alloc(cache_line_size, aligned_frame_size, MALLOC_CAP_SPIRAM);
+    h264_out_buf = (uint8_t *)heap_caps_aligned_alloc(cache_line_size, aligned_h264_size, MALLOC_CAP_SPIRAM);
+    
     if (!camera_frame_buf || !h264_out_buf) {
         ESP_LOGE(TAG, "Failed to allocate frame buffers in SPIRAM");
         return;
