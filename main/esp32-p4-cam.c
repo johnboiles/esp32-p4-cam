@@ -25,6 +25,7 @@
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
 #include "esp_video_device.h"
+#include <freertos/ringbuf.h>
 
 #ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
@@ -69,34 +70,46 @@ static httpd_handle_t server = NULL;  // Add server handle declaration
 static uint8_t *camera_frame_buf = NULL; // For RGB565
 static uint8_t *h264_out_buf = NULL; // Output buffer (adjust size as needed)
 
-// Add a flag to signal new frame
-static volatile bool new_frame_ready = false;
+// Ring buffer configuration
+#define RINGBUF_SIZE (CAMERA_WIDTH * CAMERA_HEIGHT * 10)  // Size for 2 frames
+#define MAX_FRAME_SIZE (CAMERA_WIDTH * CAMERA_HEIGHT)    // Maximum encoded frame size
 
-// Add a global variable to store the encoded frame size
-static size_t encoded_frame_size = 0;
+// Ring buffer handle
+static RingbufHandle_t frame_ringbuf = NULL;
+
+// Frame structure to store in ring buffer
+typedef struct {
+    size_t size;
+    uint8_t data[MAX_FRAME_SIZE];
+} encoded_frame_t;
+
+// Initialize ring buffer
+static void init_frame_buffer(void)
+{
+    frame_ringbuf = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
+    if (frame_ringbuf == NULL) {
+        ESP_LOGE(TAG, "Failed to create ring buffer");
+    }
+}
 
 // HTTP server handlers
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "video/H264");
     while (1) {
-        // Wait for a new frame
-        while (!new_frame_ready) {
-            vTaskDelay(pdMS_TO_TICKS(10)); // 10ms delay
+        // Get frame from ring buffer
+        size_t size;
+        encoded_frame_t *frame = xRingbufferReceive(frame_ringbuf, &size, pdMS_TO_TICKS(100));
+        if (frame != NULL) {
+            // Send H264 data
+            esp_err_t res = httpd_resp_send_chunk(req, (const char *)frame->data, frame->size);
+            if (res != ESP_OK) {
+                // Connection closed or error
+                vRingbufferReturnItem(frame_ringbuf, frame);
+                break;
+            }
+            vRingbufferReturnItem(frame_ringbuf, frame);
         }
-
-        // Send H264 data using the actual encoded frame size
-        esp_err_t res = httpd_resp_send_chunk(req, (const char *)h264_out_buf, encoded_frame_size);
-        if (res != ESP_OK) {
-            // Connection closed or error
-            break;
-        }
-
-        // Reset the flag
-        new_frame_ready = false;
-
-        // Optional: Add a small delay to control the streaming rate
-        vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay
     }
     return ESP_OK;
 }
@@ -381,44 +394,21 @@ static void capture_and_encode_task(void *arg)
         if (err != ESP_H264_ERR_OK) {
             ESP_LOGE(TAG, "Failed to encode frame: %d", err);
         } else {
-            // Debug: Print first few bytes of encoded data to verify NAL units
-            ESP_LOGI(TAG, "Encoded frame: %d bytes", enc_out.raw_data.len);
-            if (enc_out.raw_data.len > 0) {
-                ESP_LOGI(TAG, "First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                    enc_out.raw_data.buffer[0], enc_out.raw_data.buffer[1], enc_out.raw_data.buffer[2], enc_out.raw_data.buffer[3],
-                    enc_out.raw_data.buffer[4], enc_out.raw_data.buffer[5], enc_out.raw_data.buffer[6], enc_out.raw_data.buffer[7],
-                    enc_out.raw_data.buffer[8], enc_out.raw_data.buffer[9], enc_out.raw_data.buffer[10], enc_out.raw_data.buffer[11],
-                    enc_out.raw_data.buffer[12], enc_out.raw_data.buffer[13], enc_out.raw_data.buffer[14], enc_out.raw_data.buffer[15]);
+            // Allocate space in ring buffer
+            void *item;
+            if (xRingbufferSendAcquire(frame_ringbuf, &item, sizeof(encoded_frame_t), pdMS_TO_TICKS(100)) == pdTRUE) {
+                encoded_frame_t *frame = (encoded_frame_t *)item;
+                // Copy encoded data to ring buffer
+                frame->size = enc_out.length;
+                // Maybe could figure out how to put this directly into the ring buffer
+                memcpy(frame->data, enc_out.raw_data.buffer, enc_out.length);
                 
-                // Log all NAL unit types and sizes in the buffer
-                size_t i = 0;
-                while (i + 4 < enc_out.raw_data.len) {
-                    if (enc_out.raw_data.buffer[i] == 0x00 && enc_out.raw_data.buffer[i+1] == 0x00 &&
-                        enc_out.raw_data.buffer[i+2] == 0x00 && enc_out.raw_data.buffer[i+3] == 0x01) {
-                        uint8_t nal_type = enc_out.raw_data.buffer[i+4] & 0x1F;
-                        // Find the next NAL unit start
-                        size_t next_nal = i + 4;
-                        while (next_nal + 4 < enc_out.raw_data.len) {
-                            if (enc_out.raw_data.buffer[next_nal] == 0x00 && 
-                                enc_out.raw_data.buffer[next_nal+1] == 0x00 &&
-                                enc_out.raw_data.buffer[next_nal+2] == 0x00 && 
-                                enc_out.raw_data.buffer[next_nal+3] == 0x01) {
-                                break;
-                            }
-                            next_nal++;
-                        }
-                        size_t nal_size = next_nal - i;
-                        ESP_LOGI(TAG, "NAL unit type: %d at offset %d, size: %d bytes", nal_type, (int)i, (int)nal_size);
-                        i = next_nal;
-                    } else {
-                        i++;
-                    }
-                }
+                // Send the frame to ring buffer
+                xRingbufferSendComplete(frame_ringbuf, item);
+                
+            } else {
+                // ESP_LOGW(TAG, "Ring buffer full, dropping frame");
             }
-            // Store the encoded frame size
-            encoded_frame_size = enc_out.raw_data.len;
-            // Signal that a new encoded frame is ready
-            new_frame_ready = true;
         }
 
         // Queue buffer back
@@ -508,6 +498,9 @@ void app_main(void)
     http_server_init();
     // Start capture and encode task
     xTaskCreate(capture_and_encode_task, "capture_and_encode", 8192, NULL, 5, NULL);
+
+    // Initialize ring buffer
+    init_frame_buffer();
 
     ESP_LOGI(TAG, "ESP32-P4 Camera initialized");
 }

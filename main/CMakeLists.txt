@@ -8,6 +8,7 @@ idf_component_register(
         esp_wifi
         nvs_flash
         espressif__esp_video
+        esp_ringbuf
 )
 
 # Add SC2336 sensor include directory
